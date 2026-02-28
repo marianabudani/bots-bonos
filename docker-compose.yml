@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  bot-haute:
+    build: ./bot-haute
+    container_name: discord-bot-haute
+    restart: unless-stopped
+    env_file:
+      - ./bot-haute/.env
+    volumes:
+      - ./bot-haute/employees_data.json:/app/employees_data.json
+    networks:
+      - bots-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  bot-ltdgrove:
+    build: ./bot-ltdgrove
+    container_name: discord-bot-ltdgrove
+    restart: unless-stopped
+    env_file:
+      - ./bot-ltdgrove/.env
+    volumes:
+      - ./bot-ltdgrove/employees_data.json:/app/employees_data.json
+    networks:
+      - bots-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  bots-network:
+    driver: bridge
