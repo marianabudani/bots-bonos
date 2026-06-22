@@ -84,12 +84,16 @@ function extractDNI(text) {
   return null;
 }
 
-// Extraer nombre
+// Extraer nombre — funciona con cualquier log que tenga [DNI] Nombre Apellido ha ...
 function extractName(text) {
   const cleanedText = cleanText(text);
-  const match = cleanedText.match(/\[\s*[A-Z0-9]{8}\s*\]\s+([^h]+?)(?:\s+ha\s+(?:retirado|guardado|enviado))/i);
+  // Captura todo lo que hay entre el [DNI] y el primer "ha "
+  const match = cleanedText.match(/\[\s*[A-Z0-9]{8}\s*\]\s+(.+?)\s+ha\s+/i);
   if (match) {
-    return match[1].trim();
+    const candidate = match[1].trim();
+    // Descartar si lo capturado es solo otro código DNI
+    if (/^[A-Z0-9]{8}$/.test(candidate)) return null;
+    return candidate;
   }
   return null;
 }
@@ -118,7 +122,7 @@ function processLog(message) {
     
     if (dni && amount > 0) {
       if (!employees[dni]) {
-        employees[dni] = { name: dni, sales: [] };
+        employees[dni] = { name: dni, sales: [], createdAt: new Date().toISOString() };
       }
       
       const alreadyProcessed = employees[dni].sales.some(sale => sale.messageId === message.id);
@@ -141,23 +145,18 @@ function processLog(message) {
     }
   }
   
-  // Buscar nombre de empleado
-  if (cleanedContent.toLowerCase().includes('ha retirado') || 
-      cleanedContent.toLowerCase().includes('ha guardado') || 
-      cleanedContent.toLowerCase().includes('ha enviado')) {
-    
-    const dni = extractDNI(content);
-    const name = extractName(content);
-    
-    if (dni && name) {
-      if (!employees[dni]) {
-        employees[dni] = { name: name, sales: [] };
-      } else {
-        employees[dni].name = name;
-      }
-      saveData();
-      return false;
+  // Intentar extraer nombre de cualquier log que tenga [DNI] Nombre ha ...
+  // Cubre: ha retirado, ha enviado, ha reclutado, ha entrado/salido de servicio, etc.
+  const dni2 = extractDNI(content);
+  const name2 = extractName(content);
+  if (dni2 && name2) {
+    if (!employees[dni2]) {
+      employees[dni2] = { name: name2, sales: [], createdAt: new Date().toISOString() };
+    } else if (employees[dni2].name === dni2) {
+      // Solo sobreescribir si el nombre actual es el DNI por defecto
+      employees[dni2].name = name2;
     }
+    saveData();
   }
   
   return false;
@@ -219,7 +218,15 @@ function generateReport() {
     list += `   └ ${emp.salesCount} venta(s) → $${emp.totalSales.toLocaleString('es-AR')} → Bono: $${emp.bonus.toLocaleString('es-AR')}\n\n`;
   });
   
-  embed.addFields({ name: '👥 Detalle por Empleado', value: list || 'Sin datos' });
+  const listText = list || 'Sin datos';
+  if (listText.length <= 1024) {
+    embed.addFields({ name: '👥 Detalle por Empleado', value: listText, inline: false });
+  } else {
+    const chunks = listText.match(/[\s\S]{1,1024}/g) || [];
+    chunks.forEach((chunk, i) => {
+      embed.addFields({ name: i === 0 ? '👥 Detalle por Empleado' : '\u200b', value: chunk, inline: false });
+    });
+  }
   
   return embed;
 }
@@ -231,6 +238,41 @@ function resetWeek() {
   console.log('🔄 Semana reseteada');
 }
 
+// Eliminar empleados sin actividad en las últimas 2 semanas
+function removeInactiveEmployees() {
+  const TWO_WEEKS_MS = 14 * 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  let removed = 0;
+
+  for (const [dni, data] of Object.entries(employees)) {
+    if (data.sales.length === 0) {
+      // Si nunca tuvo ventas y fue creado hace más de 2 semanas
+      const created = data.createdAt ? new Date(data.createdAt).getTime() : 0;
+      if (now - created > TWO_WEEKS_MS) {
+        delete employees[dni];
+        removed++;
+        console.log(`🗑️ Empleado inactivo eliminado: ${dni}`);
+      }
+      continue;
+    }
+
+    // Fecha de la última venta
+    const lastSaleDate = Math.max(...data.sales.map(s => new Date(s.date).getTime()));
+    if (now - lastSaleDate > TWO_WEEKS_MS) {
+      delete employees[dni];
+      removed++;
+      console.log(`🗑️ Empleado inactivo eliminado: ${dni} (última venta hace más de 2 semanas)`);
+    }
+  }
+
+  if (removed > 0) {
+    saveData();
+    console.log(`🗑️ Total eliminados por inactividad: ${removed}`);
+  }
+
+  return removed;
+}
+
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
   
@@ -245,22 +287,7 @@ client.on('messageCreate', async (message) => {
   const args = message.content.slice(1).trim().split(/ +/);
   const command = args[0].toLowerCase();
   
-// Comandos
-client.on('messageCreate', async (message) => {
-  if (message.author.bot) return;
-  
-  // Procesar logs automáticamente
-  if (message.channel.id === CONFIG.logsChannelId) {
-    processLog(message);
-    return;
-  }
-  
-  // Comandos en canal de bonos
-  if (message.channel.id !== CONFIG.bonusChannelId) return;
-  if (!message.content.startsWith('!')) return;
-  
-  const args = message.content.slice(1).trim().split(/ +/);
-  const command = args[0].toLowerCase();
+// (segundo listener eliminado — era duplicado)
   
   // !test
   if (command === 'test' || command === 'ping') {
@@ -401,50 +428,87 @@ client.on('messageCreate', async (message) => {
   }
   
   // !leer
+  // Uso: !leer desde DD/MM/YYYY hasta DD/MM/YYYY   → rango de fechas
+  //      !leer fecha DD/MM/YYYY                     → desde esa fecha hasta hoy
+  //      !leer cantidad N                            → últimos N mensajes
   if (command === 'leer') {
     if (!message.member.permissions.has(Discord.PermissionFlagsBits.Administrator)) {
       return message.reply('❌ Solo administradores.');
     }
 
     const subCmd = args[1];
-    const value = args[2];
-
-    if (!subCmd || !value) {
-      return message.reply('❌ Uso: `!leer fecha DD/MM/YYYY` o `!leer cantidad 100`');
-    }
 
     const logsChannel = client.channels.cache.get(CONFIG.logsChannelId);
     if (!logsChannel) {
       return message.reply('❌ Canal de logs no encontrado.');
     }
 
-    await message.reply('⏳ Leyendo logs...');
+    // Validar subcomandos
+    const validSubs = ['desde', 'fecha', 'cantidad'];
+    if (!subCmd || !validSubs.includes(subCmd)) {
+      return message.reply(
+        '❌ Uso:\n' +
+        '• `!leer desde DD/MM/YYYY hasta DD/MM/YYYY` — rango exacto\n' +
+        '• `!leer fecha DD/MM/YYYY` — desde esa fecha hasta hoy\n' +
+        '• `!leer cantidad N` — últimos N mensajes'
+      );
+    }
+
+    // --- Parsear parámetros ---
+    let startDate = null;
+    let endDate = null;
+    let limit = null;
+
+    function parseDate(str, endOfDay = false) {
+      const [day, month, year] = (str || '').split('/').map(Number);
+      if (!day || !month || !year) return null;
+      const d = new Date(year, month - 1, day, endOfDay ? 23 : 0, endOfDay ? 59 : 0, endOfDay ? 59 : 0);
+      return isNaN(d.getTime()) ? null : d;
+    }
+
+    if (subCmd === 'desde') {
+      // !leer desde DD/MM/YYYY hasta DD/MM/YYYY
+      const hastaIdx = args.findIndex(a => a.toLowerCase() === 'hasta');
+      if (hastaIdx === -1 || !args[2] || !args[hastaIdx + 1]) {
+        return message.reply('❌ Uso: `!leer desde DD/MM/YYYY hasta DD/MM/YYYY`');
+      }
+      startDate = parseDate(args[2], false);
+      endDate   = parseDate(args[hastaIdx + 1], true);
+      if (!startDate || !endDate) return message.reply('❌ Fechas inválidas. Formato: DD/MM/YYYY');
+      if (startDate > endDate)    return message.reply('❌ La fecha de inicio debe ser anterior a la de fin.');
+
+    } else if (subCmd === 'fecha') {
+      startDate = parseDate(args[2], false);
+      if (!startDate) return message.reply('❌ Fecha inválida. Formato: DD/MM/YYYY');
+      endDate = new Date(); // hasta ahora
+
+    } else if (subCmd === 'cantidad') {
+      limit = parseInt(args[2]);
+      if (isNaN(limit) || limit < 1 || limit > 1000) {
+        return message.reply('❌ Cantidad entre 1 y 1000.');
+      }
+    }
+
+    // --- Construir descripción del período ---
+    let periodDesc = '';
+    if (startDate && endDate) {
+      periodDesc = `${startDate.toLocaleDateString('es-AR')} → ${endDate.toLocaleDateString('es-AR')}`;
+    } else if (limit) {
+      periodDesc = `Últimos ${limit} mensajes`;
+    }
+
+    await message.reply(`⏳ Leyendo logs... (${periodDesc})`);
 
     try {
       let messagesToProcess = [];
-      let startDate = null;
-      let limit = null;
-
-      if (subCmd === 'fecha') {
-        const [day, month, year] = value.split('/').map(Number);
-        if (!day || !month || !year) {
-          return message.channel.send('❌ Formato: DD/MM/YYYY');
-        }
-        startDate = new Date(year, month - 1, day, 0, 0, 0);
-      } else if (subCmd === 'cantidad') {
-        limit = parseInt(value);
-        if (isNaN(limit) || limit < 1 || limit > 1000) {
-          return message.channel.send('❌ Cantidad entre 1 y 1000.');
-        }
-      } else {
-        return message.channel.send('❌ Usa: `fecha` o `cantidad`');
-      }
-
       let lastId;
       let totalFetched = 0;
       let processed = 0;
 
-      while (true) {
+      // Limpiar ventas del período antes de reprocesar para evitar duplicados visuales
+      // (el chequeo por messageId en processLog ya previene duplicados reales)
+
+      outerLoop: while (true) {
         const options = { limit: 100 };
         if (lastId) options.before = lastId;
 
@@ -452,50 +516,103 @@ client.on('messageCreate', async (message) => {
         if (msgs.size === 0) break;
 
         for (const msg of msgs.values()) {
-          if (startDate && msg.createdAt < startDate) continue;
-          
+          // Filtro por rango de fechas
+          if (startDate && msg.createdAt < startDate) {
+            // Si ya pasamos el inicio, podemos parar (mensajes en orden desc)
+            break outerLoop;
+          }
+          if (endDate && msg.createdAt > endDate) continue;
+
           messagesToProcess.push(msg);
           totalFetched++;
 
-          if (limit && totalFetched >= limit) break;
+          if (limit && totalFetched >= limit) break outerLoop;
         }
 
-        if (limit && totalFetched >= limit) break;
         if (msgs.size < 100) break;
-
         lastId = msgs.last().id;
       }
 
-      messagesToProcess.reverse();
-      
-      console.log(`📚 Procesando ${messagesToProcess.length} mensajes...`);
-      
+      messagesToProcess.reverse(); // procesar del más viejo al más nuevo
+      console.log(`📚 Procesando ${messagesToProcess.length} mensajes (${periodDesc})...`);
+
       for (const msg of messagesToProcess) {
-        if (processLog(msg)) {
-          processed++;
+        if (processLog(msg)) processed++;
+      }
+
+      // --- Calcular bonos SOLO del período leído ---
+      const periodSales = {};
+      for (const [dni, data] of Object.entries(employees)) {
+        const salesInRange = data.sales.filter(s => {
+          const d = new Date(s.date);
+          if (startDate && d < startDate) return false;
+          if (endDate   && d > endDate)   return false;
+          return true;
+        });
+        if (salesInRange.length > 0 || limit) {
+          // Con !cantidad no podemos filtrar por fecha, mostramos todo
+          const salesForCalc = limit ? data.sales : salesInRange;
+          const total = salesForCalc.reduce((sum, s) => sum + s.amount, 0);
+          const bonus = Math.round(total * (CONFIG.bonusPercentage / 100));
+          periodSales[dni] = { name: data.name, salesCount: salesForCalc.length, total, bonus };
         }
       }
 
-      const embed = new Discord.EmbedBuilder()
+      const sortedPeriod = Object.entries(periodSales)
+        .map(([dni, d]) => ({ dni, ...d }))
+        .sort((a, b) => b.total - a.total);
+
+      const grandTotal   = sortedPeriod.reduce((s, e) => s + e.total, 0);
+      const grandBonus   = sortedPeriod.reduce((s, e) => s + e.bonus, 0);
+
+      // Embed resumen de lectura
+      const embedOk = new Discord.EmbedBuilder()
         .setColor('#00FF00')
         .setTitle('✅ Logs Procesados')
+        .setDescription(periodDesc)
         .addFields(
-          { name: '📥 Leídos', value: `${totalFetched}`, inline: true },
-          { name: '💰 Ventas', value: `${processed}`, inline: true },
-          { name: '👥 Empleados', value: `${Object.keys(employees).length}`, inline: true }
+          { name: '📥 Mensajes leídos', value: `${totalFetched}`, inline: true },
+          { name: '💰 Ventas nuevas',   value: `${processed}`,    inline: true },
+          { name: '👥 Empleados',       value: `${Object.keys(employees).length}`, inline: true }
         );
 
-      await message.channel.send({ embeds: [embed] });
-      
-      if (processed > 0) {
-        const total = Object.values(employees).reduce((sum, emp) => 
-          sum + emp.sales.reduce((s, sale) => s + sale.amount, 0), 0
-        );
-        await message.channel.send(`📊 Total acumulado: $${total.toLocaleString('es-AR')}`);
+      await message.channel.send({ embeds: [embedOk] });
+
+      // Embed reporte de bonos del período
+      if (sortedPeriod.length > 0) {
+        const embedReport = new Discord.EmbedBuilder()
+          .setColor('#FFD700')
+          .setTitle('📊 REPORTE DE BONOS — PERÍODO')
+          .setDescription(`**${periodDesc}**`)
+          .addFields(
+            { name: '💵 Total Ventas', value: `$${grandTotal.toLocaleString('es-AR')}`, inline: true },
+            { name: '🎁 Total Bonos',  value: `$${grandBonus.toLocaleString('es-AR')}`,  inline: true },
+            { name: '📈 Porcentaje',   value: `${CONFIG.bonusPercentage}%`,               inline: true }
+          )
+          .setTimestamp();
+
+        let list = '';
+        sortedPeriod.forEach((emp, i) => {
+          const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : '▫️';
+          list += `${medal} **${emp.name}** (${emp.dni})\n`;
+          list += `   └ ${emp.salesCount} venta(s) → $${emp.total.toLocaleString('es-AR')} → Bono: $${emp.bonus.toLocaleString('es-AR')}\n\n`;
+        });
+
+        const listText = list.trim() || 'Sin datos';
+        if (listText.length <= 1024) {
+          embedReport.addFields({ name: '👥 Detalle por Empleado', value: listText, inline: false });
+        } else {
+          const chunks = listText.match(/[\s\S]{1,1024}/g) || [];
+          chunks.forEach((chunk, i) => {
+            embedReport.addFields({ name: i === 0 ? '👥 Detalle por Empleado' : '\u200b', value: chunk, inline: false });
+          });
+        }
+
+        await message.channel.send({ embeds: [embedReport] });
       }
 
     } catch (error) {
-      console.error('Error:', error);
+      console.error('Error en !leer:', error);
       await message.channel.send('❌ Error al procesar logs.');
     }
   }
@@ -561,7 +678,7 @@ client.on('messageCreate', async (message) => {
       .addFields(
         { name: '📊 Consultas', value: '`!test` - Estado\n`!reporte` - Reporte semanal\n`!empleados` - Lista\n`!empleado <DNI>` - Detalle', inline: false },
         { name: '🔧 Pruebas', value: '`!testlog <texto>` - Probar log', inline: false },
-        { name: '🔒 Admin', value: '`!leer fecha DD/MM/YYYY`\n`!leer cantidad N`\n`!cerrar` - Cerrar semana\n`!porcentaje N`\n`!resetdata`', inline: false }
+        { name: '🔒 Admin', value: '`!leer desde DD/MM/YYYY hasta DD/MM/YYYY` — rango\n`!leer fecha DD/MM/YYYY` — desde fecha hasta hoy\n`!leer cantidad N` — últimos N mensajes\n`!cerrar` — Cerrar semana\n`!porcentaje N`\n`!resetdata`', inline: false }
       )
       .setFooter({ text: `Bono: ${CONFIG.bonusPercentage}% | Semana: Lun-Dom` });
     
@@ -569,22 +686,42 @@ client.on('messageCreate', async (message) => {
   }
 });
 
-});
-
 function scheduleWeeklyClose() {
+  let weekClosedFlag = false; // evita doble disparo en el mismo minuto
+
   setInterval(() => {
     const now = new Date();
-    const argTime = new Date(now.toLocaleString('en-US', { timeZone: CONFIG.timezone }));
-    
-    if (argTime.getDay() === 0 && argTime.getHours() === 23 && argTime.getMinutes() === 0) {
-      console.log('⏰ Cierre automático');
-      
+    const localTime = new Date(now.toLocaleString('en-US', { timeZone: CONFIG.timezone }));
+
+    const isSunday2359 = localTime.getDay() === 0 &&
+                          localTime.getHours() === 23 &&
+                          localTime.getMinutes() === 59;
+
+    // Resetear el flag cuando ya pasó el minuto de cierre
+    if (!isSunday2359) weekClosedFlag = false;
+
+    // Cierre semanal automático (domingo 23:59 → el lunes arranca semana nueva)
+    if (isSunday2359 && !weekClosedFlag) {
+      weekClosedFlag = true;
+      console.log('⏰ Cierre automático (domingo 23:59)');
+
       const channel = client.channels.cache.get(CONFIG.bonusChannelId);
       if (channel) {
         const embed = generateReport();
         channel.send({ embeds: [embed] });
         channel.send('✅ Semana cerrada automáticamente.');
         resetWeek();
+      }
+    }
+
+    // Limpieza diaria de inactivos (cada día a las 03:00)
+    if (localTime.getHours() === 3 && localTime.getMinutes() === 0) {
+      const removed = removeInactiveEmployees();
+      if (removed > 0) {
+        const channel = client.channels.cache.get(CONFIG.bonusChannelId);
+        if (channel) {
+          channel.send(`🗑️ Se eliminaron **${removed}** empleado(s) sin actividad en las últimas 2 semanas.`);
+        }
       }
     }
   }, 60000);
